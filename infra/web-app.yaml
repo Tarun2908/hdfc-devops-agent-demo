@@ -1,0 +1,2474 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# =============================================================================
+# eks-webapp: VPC + EKS + RDS MySQL + sample web app behind an internet-facing ALB
+#
+# Layout (later tasks append to the marked sections only):
+#   Metadata    - parameter groups for the CloudFormation console
+#   Parameters  - every parameter has a default, a constraint, and a description
+#   Conditions  - HasAdminPrincipal, HasCertificate, DbMultiAzEnabled,
+#                 DbLogExportEnabled
+#   Mappings    - PrefixToHostBits (VPC prefix length -> Fn::Cidr host bits)
+#   Resources   - ParamValidator first, then network, security, EKS, database,
+#                 Manifest_Deployer, and Kubernetes manifests
+#   Outputs     - ApplicationUrl, ClusterName, DatabaseEndpoint, DatabaseSecretArn,
+#                 KubeconfigCommand
+#
+# Source repository: https://github.com/Tarun2908/hdfc-devops-agent-demo
+# Deployment steps: see HOWTO.md in the repository root.
+#
+# Deployment note: the finished template embeds the sample app and the buildspec
+# and will exceed the 51,200 byte direct-upload limit (maximum is 1 MB). Deploy
+# it from an S3 URL (the console does this automatically).
+#
+# IAM exception convention (Requirement 8.1): no policy statement may combine
+# Action "*" with Resource "*" unless it is copied from an AWS-documented policy.
+# Each such statement must carry a comment of this form directly above it:
+#   # Source: https://docs.aws.amazon.com/<documentation page>
+# =============================================================================
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Project
+        Parameters:
+          - ProjectName
+          - Environment
+      - Label:
+          default: Network
+        Parameters:
+          - VpcCidr
+          - IngressCidr
+          - ApiAccessCidr
+      - Label:
+          default: EKS cluster and nodes
+        Parameters:
+          - KubernetesVersion
+          - NodeInstanceType
+          - NodeMinSize
+          - NodeDesiredSize
+          - NodeMaxSize
+          - AdminPrincipalArn
+      - Label:
+          default: Database
+        Parameters:
+          - DbInstanceClass
+          - DbAllocatedStorage
+          - DbMultiAz
+          - EnableDbLogExport
+      - Label:
+          default: Application
+        Parameters:
+          - AppReplicas
+          - CertificateArn
+    ParameterLabels:
+      ProjectName:
+        default: Project name
+      Environment:
+        default: Environment
+      VpcCidr:
+        default: VPC CIDR block
+      IngressCidr:
+        default: Allowed CIDR for the load balancer
+      ApiAccessCidr:
+        default: Allowed CIDR for the EKS public API endpoint
+      KubernetesVersion:
+        default: Kubernetes version
+      NodeInstanceType:
+        default: Node instance type
+      NodeMinSize:
+        default: Node group minimum size
+      NodeDesiredSize:
+        default: Node group desired size
+      NodeMaxSize:
+        default: Node group maximum size
+      AdminPrincipalArn:
+        default: Additional cluster admin principal ARN
+      DbInstanceClass:
+        default: Database instance class
+      DbAllocatedStorage:
+        default: Database storage (GiB)
+      DbMultiAz:
+        default: Database Multi-AZ
+      EnableDbLogExport:
+        default: Export database logs to CloudWatch
+      AppReplicas:
+        default: Application replicas
+      CertificateArn:
+        default: ACM certificate ARN (enables HTTPS)
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: eks-webapp
+    AllowedPattern: '^[a-z][a-z0-9-]{1,19}$'
+    ConstraintDescription: 2-20 characters; lowercase letters, digits, and hyphens; must start with a letter.
+    Description: Project name used in resource names and the Project tag. 2-20 characters, lowercase letters, digits, hyphens, starting with a letter.
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues:
+      - dev
+      - test
+      - prod
+    Description: Environment name used for the Environment tag. One of dev, test, prod.
+  VpcCidr:
+    Type: String
+    Default: 10.0.0.0/16
+    AllowedPattern: '^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)/(1[6-9]|2[0-4])$'
+    ConstraintDescription: Must be an IPv4 CIDR block with a prefix length between /16 and /24.
+    Description: IPv4 CIDR block for the VPC, with a prefix length from /16 to /24. Split into two public and two private subnets.
+  IngressCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)/(3[0-2]|[12]?\d)$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block, for example 203.0.113.0/24.
+    Description: IPv4 CIDR range allowed to reach the load balancer on ports 80 and 443. Default 0.0.0.0/0 allows the whole internet.
+  ApiAccessCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: '^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)/(3[0-2]|[12]?\d)$'
+    ConstraintDescription: Must be a valid IPv4 CIDR block, for example 203.0.113.0/24.
+    Description: IPv4 CIDR range allowed to reach the public EKS API endpoint. Restrict this to your own network where possible.
+  KubernetesVersion:
+    Type: String
+    Default: "1.36"
+    AllowedValues:
+      - "1.34"
+      - "1.35"
+      - "1.36"
+      - "1.37"
+    Description: Kubernetes version for the EKS cluster. Must be a version in EKS standard support (1.34 to 1.37 when this template was written).
+  NodeInstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.medium
+      - t3.large
+      - m5.large
+      - m5.xlarge
+      - m6i.large
+      - m6i.xlarge
+    Description: EC2 instance type for worker nodes. One of the listed values.
+  NodeMinSize:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    MaxValue: 20
+    Description: Minimum number of worker nodes, 0 to 20. Must not exceed the desired size.
+  NodeDesiredSize:
+    Type: Number
+    Default: 2
+    MinValue: 0
+    MaxValue: 20
+    Description: Desired number of worker nodes, 0 to 20. Must be between the minimum and maximum sizes.
+  NodeMaxSize:
+    Type: Number
+    Default: 4
+    MinValue: 0
+    MaxValue: 20
+    Description: Maximum number of worker nodes, 0 to 20. Must not be below the desired size.
+  AdminPrincipalArn:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:iam::\d{12}:(user|role)/[\w+=,.@/-]+$'
+    ConstraintDescription: Must be empty or an IAM user or role ARN.
+    Description: Optional IAM user or role ARN to grant cluster administrator access. Leave empty for none. The stack creator is always an admin.
+  DbInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues:
+      - db.t3.micro
+      - db.t3.small
+      - db.t3.medium
+      - db.m5.large
+      - db.r5.large
+    Description: RDS instance class for the MySQL database. One of the listed values.
+  DbAllocatedStorage:
+    Type: Number
+    Default: 20
+    MinValue: 20
+    MaxValue: 65536
+    Description: Allocated database storage in GiB, from 20 to 65536.
+  DbMultiAz:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Set to true to deploy a standby database replica in a second Availability Zone. Allowed values true or false.
+  EnableDbLogExport:
+    Type: String
+    Default: "false"
+    AllowedValues:
+      - "true"
+      - "false"
+    Description: Set to true to export database error and slow query logs to CloudWatch Logs. Allowed values true or false.
+  AppReplicas:
+    Type: Number
+    Default: 2
+    MinValue: 2
+    MaxValue: 10
+    Description: Number of sample application replicas, 2 to 10. Replicas are spread across Availability Zones.
+  CertificateArn:
+    Type: String
+    Default: ""
+    AllowedPattern: '^$|^arn:aws[a-zA-Z-]*:acm:[a-z0-9-]+:\d{12}:certificate/[a-fA-F0-9-]+$'
+    ConstraintDescription: Must be empty or an ACM certificate ARN.
+    Description: Optional ACM certificate ARN. When set, the load balancer serves HTTPS on 443 and redirects HTTP to HTTPS. Empty means HTTP only.
+
+Conditions:
+  HasAdminPrincipal: !Not [!Equals [!Ref AdminPrincipalArn, ""]]
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
+  DbMultiAzEnabled: !Equals [!Ref DbMultiAz, "true"]
+  DbLogExportEnabled: !Equals [!Ref EnableDbLogExport, "true"]
+  # One condition per allowed VPC prefix length. cfn-lint rejects the two-level
+  # FindInMap key form (E1017), so host bits are chosen with nested Fn::If.
+  VpcPrefix16: !Equals [!Select [1, !Split ["/", !Ref VpcCidr]], "16"]
+  VpcPrefix17: !Equals [!Select [1, !Split ["/", !Ref VpcCidr]], "17"]
+  VpcPrefix18: !Equals [!Select [1, !Split ["/", !Ref VpcCidr]], "18"]
+  VpcPrefix19: !Equals [!Select [1, !Split ["/", !Ref VpcCidr]], "19"]
+  VpcPrefix20: !Equals [!Select [1, !Split ["/", !Ref VpcCidr]], "20"]
+  VpcPrefix21: !Equals [!Select [1, !Split ["/", !Ref VpcCidr]], "21"]
+  VpcPrefix22: !Equals [!Select [1, !Split ["/", !Ref VpcCidr]], "22"]
+  VpcPrefix23: !Equals [!Select [1, !Split ["/", !Ref VpcCidr]], "23"]
+  VpcPrefix24: !Equals [!Select [1, !Split ["/", !Ref VpcCidr]], "24"]
+
+Mappings:
+  # Fn::Cidr [VpcCidr, 4, hostbits] needs host bits = 32 - (prefix + 2).
+  # Usage: !FindInMap [PrefixToHostBits, Bits, !Select [1, !Split ["/", !Ref VpcCidr]]]
+  PrefixToHostBits:
+    Bits:
+      "16": 14
+      "17": 13
+      "18": 12
+      "19": 11
+      "20": 10
+      "21": 9
+      "22": 8
+      "23": 7
+      "24": 6
+
+Resources:
+  # ---------------------------------------------------------------------------
+  # Parameter validation (Requirement 3.8)
+  # ---------------------------------------------------------------------------
+  ParamValidatorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ParamValidatorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Validates node group size parameters (0 <= min <= desired <= max)
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 30
+      Role: !GetAtt ParamValidatorRole.Arn
+      Code:
+        ZipFile: |
+          import cfnresponse
+
+          def handler(event, context):
+              try:
+                  if event["RequestType"] == "Delete":
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+                      return
+                  p = event["ResourceProperties"]
+                  lo, de, hi = int(p["Min"]), int(p["Desired"]), int(p["Max"])
+                  if not 0 <= lo <= de <= hi:
+                      cfnresponse.send(
+                          event, context, cfnresponse.FAILED, {},
+                          reason="Invalid node group sizes: min=%d desired=%d max=%d "
+                                 "(required: 0 <= min <= desired <= max)" % (lo, de, hi))
+                      return
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, {})
+              except Exception as e:
+                  cfnresponse.send(
+                      event, context, cfnresponse.FAILED, {},
+                      reason="Invalid node group sizes: %s" % e)
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  ParamValidator:
+    Type: Custom::ParamValidator
+    Properties:
+      ServiceToken: !GetAtt ParamValidatorFunction.Arn
+      Min: !Ref NodeMinSize
+      Desired: !Ref NodeDesiredSize
+      Max: !Ref NodeMaxSize
+
+  # ---------------------------------------------------------------------------
+  # Network (Requirements 2.1, 2.2, 2.3, 2.5, 2.7)
+  # Fn::Cidr splits VpcCidr into four blocks: 0,1 = public; 2,3 = private.
+  # ---------------------------------------------------------------------------
+  Vpc:
+    Type: AWS::EC2::VPC
+    DependsOn: ParamValidator
+    Properties:
+      CidrBlock: !Ref VpcCidr
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-vpc
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-igw
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [0, !Cidr [!Ref VpcCidr, 4, !If [VpcPrefix16, 14, !If [VpcPrefix17, 13, !If [VpcPrefix18, 12, !If [VpcPrefix19, 11, !If [VpcPrefix20, 10, !If [VpcPrefix21, 9, !If [VpcPrefix22, 8, !If [VpcPrefix23, 7, 6]]]]]]]]]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-public-a
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [1, !Cidr [!Ref VpcCidr, 4, !If [VpcPrefix16, 14, !If [VpcPrefix17, 13, !If [VpcPrefix18, 12, !If [VpcPrefix19, 11, !If [VpcPrefix20, 10, !If [VpcPrefix21, 9, !If [VpcPrefix22, 8, !If [VpcPrefix23, 7, 6]]]]]]]]]]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-public-b
+        - Key: kubernetes.io/role/elb
+          Value: "1"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      CidrBlock: !Select [2, !Cidr [!Ref VpcCidr, 4, !If [VpcPrefix16, 14, !If [VpcPrefix17, 13, !If [VpcPrefix18, 12, !If [VpcPrefix19, 11, !If [VpcPrefix20, 10, !If [VpcPrefix21, 9, !If [VpcPrefix22, 8, !If [VpcPrefix23, 7, 6]]]]]]]]]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-private-a
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      CidrBlock: !Select [3, !Cidr [!Ref VpcCidr, 4, !If [VpcPrefix16, 14, !If [VpcPrefix17, 13, !If [VpcPrefix18, 12, !If [VpcPrefix19, 11, !If [VpcPrefix20, 10, !If [VpcPrefix21, 9, !If [VpcPrefix22, 8, !If [VpcPrefix23, 7, 6]]]]]]]]]]
+      MapPublicIpOnLaunch: false
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-private-b
+        - Key: kubernetes.io/role/internal-elb
+          Value: "1"
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-public-rt
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PublicDefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetA
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnetB
+      RouteTableId: !Ref PublicRouteTable
+
+  NatEipA:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-nat-eip-a
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  NatEipB:
+    Type: AWS::EC2::EIP
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-nat-eip-b
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  NatGatewayA:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipA.AllocationId
+      SubnetId: !Ref PublicSubnetA
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-nat-a
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  NatGatewayB:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatEipB.AllocationId
+      SubnetId: !Ref PublicSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-nat-b
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateRouteTableA:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-private-rt-a
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateRouteTableB:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-private-rt-b
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  PrivateDefaultRouteA:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableA
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayA
+
+  PrivateDefaultRouteB:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTableB
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayB
+
+  PrivateSubnetARouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetA
+      RouteTableId: !Ref PrivateRouteTableA
+
+  PrivateSubnetBRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnetB
+      RouteTableId: !Ref PrivateRouteTableB
+
+  # ---------------------------------------------------------------------------
+  # Security groups (Requirements 5.7, 7.4, 7.6, 8.6)
+  # Rules that would make two groups reference each other are separate
+  # AWS::EC2::SecurityGroupIngress resources to avoid circular dependencies.
+  # Rules from the EKS cluster security group (443, 10250, 1025-65535 to the
+  # nodes) and the DeployerSecurityGroup ingress on the cluster security group
+  # are added in task 6.1, because that group exists only after the cluster.
+  # ---------------------------------------------------------------------------
+  AlbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Internet-facing ALB. Inbound 80 (and 443 with a certificate) from IngressCidr only.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref IngressCidr
+          Description: HTTP from the allowed CIDR
+        - !If
+          - HasCertificate
+          - IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: !Ref IngressCidr
+            Description: HTTPS from the allowed CIDR
+          - !Ref AWS::NoValue
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          DestinationSecurityGroupId: !Ref NodeSecurityGroup
+          Description: Application traffic to the worker nodes
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-alb-sg
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  NodeSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EKS worker nodes. Application traffic only from the ALB security group.
+      VpcId: !Ref Vpc
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-node-sg
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  NodeIngressFromAlb:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref AlbSecurityGroup
+      Description: Application traffic from the ALB
+
+  NodeIngressFromSelf:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: "-1"
+      SourceSecurityGroupId: !Ref NodeSecurityGroup
+      Description: Node to node and pod to pod traffic
+
+  DbSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: RDS MySQL. Inbound 3306 only from the worker node security group.
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref NodeSecurityGroup
+          Description: MySQL from worker nodes
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db-sg
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DeployerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Manifest_Deployer CodeBuild project. Outbound HTTPS only.
+      VpcId: !Ref Vpc
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS to the EKS API and AWS service endpoints (via NAT)
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-deployer-sg
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # KMS keys (Requirements 3.5, 5.3, 8.3, 8.4)
+  # The EKS cluster role and the app role are defined in tasks 6.1 and 6.2, so
+  # the policies do not name them. Each key delegates to IAM through the account
+  # root statement; the roles then receive their kms permissions from identity
+  # policies. The RDS and Secrets Manager keys also allow use through those
+  # services only, for principals of this account (the AWS-documented pattern).
+  # ---------------------------------------------------------------------------
+  EksSecretsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub ${ProjectName}-${Environment} EKS Kubernetes secrets envelope encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          # Key policy convention: root enables IAM policies (granted to the
+          # EKS cluster role in task 6.1) and key administration.
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-eks-secrets-key
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DbStorageKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub ${ProjectName}-${Environment} RDS storage encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+          - Sid: AllowUseThroughRds
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:CreateGrant
+              - kms:ListGrants
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub rds.${AWS::Region}.amazonaws.com
+                kms:CallerAccount: !Ref AWS::AccountId
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db-storage-key
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  SecretsManagerKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub ${ProjectName}-${Environment} Secrets Manager database secret encryption
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: EnableIamPolicies
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: "*"
+          # The app role (task 6.2) gets kms:Decrypt from its identity policy;
+          # this statement limits that use to calls made through Secrets Manager.
+          - Sid: AllowUseThroughSecretsManager
+            Effect: Allow
+            Principal:
+              AWS: "*"
+            Action:
+              - kms:Encrypt
+              - kms:Decrypt
+              - kms:ReEncrypt*
+              - kms:GenerateDataKey*
+              - kms:CreateGrant
+              - kms:DescribeKey
+            Resource: "*"
+            Condition:
+              StringEquals:
+                kms:ViaService: !Sub secretsmanager.${AWS::Region}.amazonaws.com
+                kms:CallerAccount: !Ref AWS::AccountId
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-secrets-key
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # EKS cluster (Requirements 3.1, 3.3, 3.4, 3.5, 3.10, 3.11, 8.2, 10.1, 10.5)
+  # Cluster name is fixed to <ProjectName>-<Environment> so the log group name
+  # can be created before the cluster.
+  # ---------------------------------------------------------------------------
+  EksLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/eks/${ProjectName}-${Environment}/cluster
+      RetentionInDays: 30
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  EksClusterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: eks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonEKSClusterPolicy
+      Policies:
+        - PolicyName: EksSecretsEncryption
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:DescribeKey
+                  - kms:CreateGrant
+                Resource: !GetAtt EksSecretsKey.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  EksCluster:
+    Type: AWS::EKS::Cluster
+    DependsOn: EksLogGroup
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}
+      Version: !Ref KubernetesVersion
+      RoleArn: !GetAtt EksClusterRole.Arn
+      ResourcesVpcConfig:
+        SubnetIds:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        EndpointPrivateAccess: true
+        EndpointPublicAccess: true
+        PublicAccessCidrs:
+          - !Ref ApiAccessCidr
+      AccessConfig:
+        AuthenticationMode: API
+        BootstrapClusterCreatorAdminPermissions: true
+      Logging:
+        ClusterLogging:
+          EnabledTypes:
+            - Type: api
+            - Type: audit
+            - Type: authenticator
+            - Type: controllerManager
+            - Type: scheduler
+      EncryptionConfig:
+        - Provider:
+            KeyArn: !GetAtt EksSecretsKey.Arn
+          Resources:
+            - secrets
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  AdminAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Condition: HasAdminPrincipal
+    Properties:
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !Ref AdminPrincipalArn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: !Sub arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # IAM OIDC provider for IRSA (Requirement 4.4)
+  EksOidcProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: !GetAtt EksCluster.OpenIdConnectIssuerUrl
+      ClientIdList:
+        - sts.amazonaws.com
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Security group rules between the EKS cluster security group and the nodes
+  # (Requirement 7.6) and from the Manifest_Deployer to the cluster API.
+  NodeIngressFromClusterApi:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !GetAtt EksCluster.ClusterSecurityGroupId
+      Description: Extension API servers and webhooks from the control plane
+
+  NodeIngressFromClusterKubelet:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 10250
+      ToPort: 10250
+      SourceSecurityGroupId: !GetAtt EksCluster.ClusterSecurityGroupId
+      Description: Kubelet from the control plane
+
+  NodeIngressFromClusterEphemeral:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref NodeSecurityGroup
+      IpProtocol: tcp
+      FromPort: 1025
+      ToPort: 65535
+      SourceSecurityGroupId: !GetAtt EksCluster.ClusterSecurityGroupId
+      Description: Ephemeral ports from the control plane
+
+  ClusterIngressFromDeployer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !GetAtt EksCluster.ClusterSecurityGroupId
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      SourceSecurityGroupId: !Ref DeployerSecurityGroup
+      Description: Kubernetes API from the Manifest_Deployer
+
+  # ---------------------------------------------------------------------------
+  # Worker nodes (Requirements 3.6, 3.7, 3.9, 8.2, 8.5)
+  # ---------------------------------------------------------------------------
+  NodeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonEKSWorkerNodePolicy
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonEKS_CNI_Policy
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Hop limit 2 lets pods that use the node's instance profile (for example the
+  # EBS CSI node plugin) reach IMDS through the container network namespace.
+  NodeLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${ProjectName}-${Environment}-nodes
+      LaunchTemplateData:
+        MetadataOptions:
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+          HttpEndpoint: enabled
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeType: gp3
+              VolumeSize: 20
+              Encrypted: true
+              DeleteOnTermination: true
+        SecurityGroupIds:
+          - !Ref NodeSecurityGroup
+          - !GetAtt EksCluster.ClusterSecurityGroupId
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: Environment
+                Value: !Ref Environment
+          - ResourceType: volume
+            Tags:
+              - Key: Project
+                Value: !Ref ProjectName
+              - Key: Environment
+                Value: !Ref Environment
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags:
+            - Key: Project
+              Value: !Ref ProjectName
+            - Key: Environment
+              Value: !Ref Environment
+
+  NodeGroup:
+    Type: AWS::EKS::Nodegroup
+    DependsOn:
+      - VpcCniAddon
+      - KubeProxyAddon
+    Properties:
+      ClusterName: !Ref EksCluster
+      NodegroupName: !Sub ${ProjectName}-${Environment}-nodes
+      NodeRole: !GetAtt NodeRole.Arn
+      Subnets:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      InstanceTypes:
+        - !Ref NodeInstanceType
+      LaunchTemplate:
+        Id: !Ref NodeLaunchTemplate
+        Version: !GetAtt NodeLaunchTemplate.LatestVersionNumber
+      ScalingConfig:
+        MinSize: !Ref NodeMinSize
+        DesiredSize: !Ref NodeDesiredSize
+        MaxSize: !Ref NodeMaxSize
+      Tags:
+        Project: !Ref ProjectName
+        Environment: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # Managed add-ons (Requirement 4.1). vpc-cni and kube-proxy install before the
+  # node group; coredns and the EBS CSI driver need nodes, so they follow it.
+  # ---------------------------------------------------------------------------
+  VpcCniAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: vpc-cni
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  KubeProxyAddon:
+    Type: AWS::EKS::Addon
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: kube-proxy
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  CoreDnsAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: coredns
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  EbsCsiAddon:
+    Type: AWS::EKS::Addon
+    DependsOn: NodeGroup
+    Properties:
+      ClusterName: !Ref EksCluster
+      AddonName: aws-ebs-csi-driver
+      ServiceAccountRoleArn: !GetAtt EbsCsiRole.Arn
+      ResolveConflicts: OVERWRITE
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # EBS CSI IRSA role (Requirements 4.3, 8.1). Defined here, not in 6.2, because
+  # the add-on above needs its ARN. The trust policy is a JSON string because
+  # IAM condition keys must contain the cluster's OIDC issuer, and CloudFormation
+  # does not allow intrinsic functions in map keys.
+  # ---------------------------------------------------------------------------
+  EbsCsiRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Fn::Sub:
+          - |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Principal": {"Federated": "${OidcArn}"},
+                  "Action": "sts:AssumeRoleWithWebIdentity",
+                  "Condition": {
+                    "StringEquals": {
+                      "${Issuer}:sub": "system:serviceaccount:kube-system:ebs-csi-controller-sa",
+                      "${Issuer}:aud": "sts.amazonaws.com"
+                    }
+                  }
+                }
+              ]
+            }
+          - OidcArn: !Ref EksOidcProvider
+            Issuer: !Select [1, !Split ["https://", !GetAtt EksCluster.OpenIdConnectIssuerUrl]]
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonEBSCSIDriverPolicy
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # AWS Load Balancer Controller IRSA role (Requirements 4.3, 8.1).
+  # Service account: kube-system/aws-load-balancer-controller.
+  # ---------------------------------------------------------------------------
+  LbcPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      Description: !Sub AWS Load Balancer Controller permissions for ${ProjectName}-${Environment}
+      PolicyDocument:
+        # Source: https://raw.githubusercontent.com/kubernetes-sigs/aws-load-balancer-controller/main/docs/install/iam_policy.json
+        # Copied from the AWS Load Balancer Controller documentation
+        # (https://kubernetes-sigs.github.io/aws-load-balancer-controller/latest/deploy/installation/).
+        # No statement combines Action "*" with Resource "*". ARNs use the stack
+        # partition instead of the hard-coded "aws" partition in the source file.
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Action:
+              - iam:CreateServiceLinkedRole
+            Resource: "*"
+            Condition:
+              StringEquals:
+                iam:AWSServiceName: elasticloadbalancing.amazonaws.com
+          - Effect: Allow
+            Action:
+              - ec2:DescribeAccountAttributes
+              - ec2:DescribeAddresses
+              - ec2:DescribeAvailabilityZones
+              - ec2:DescribeInternetGateways
+              - ec2:DescribeVpcs
+              - ec2:DescribeVpcPeeringConnections
+              - ec2:DescribeSubnets
+              - ec2:DescribeSecurityGroups
+              - ec2:DescribeInstances
+              - ec2:DescribeNetworkInterfaces
+              - ec2:DescribeTags
+              - ec2:GetCoipPoolUsage
+              - ec2:DescribeCoipPools
+              - ec2:GetSecurityGroupsForVpc
+              - ec2:ValidateSecurityGroupQuotasForInterface
+              - ec2:DescribeIpamPools
+              - ec2:DescribeRouteTables
+              - elasticloadbalancing:DescribeLoadBalancers
+              - elasticloadbalancing:DescribeLoadBalancerAttributes
+              - elasticloadbalancing:DescribeListeners
+              - elasticloadbalancing:DescribeListenerCertificates
+              - elasticloadbalancing:DescribeSSLPolicies
+              - elasticloadbalancing:DescribeRules
+              - elasticloadbalancing:DescribeTargetGroups
+              - elasticloadbalancing:DescribeTargetGroupAttributes
+              - elasticloadbalancing:DescribeTargetHealth
+              - elasticloadbalancing:DescribeTags
+              - elasticloadbalancing:DescribeTrustStores
+              - elasticloadbalancing:DescribeListenerAttributes
+              - elasticloadbalancing:DescribeCapacityReservation
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - cognito-idp:DescribeUserPoolClient
+              - acm:ListCertificates
+              - acm:DescribeCertificate
+              - iam:ListServerCertificates
+              - iam:GetServerCertificate
+              - waf-regional:GetWebACL
+              - waf-regional:GetWebACLForResource
+              - waf-regional:AssociateWebACL
+              - waf-regional:DisassociateWebACL
+              - wafv2:GetWebACL
+              - wafv2:GetWebACLForResource
+              - wafv2:AssociateWebACL
+              - wafv2:DisassociateWebACL
+              - shield:GetSubscriptionState
+              - shield:DescribeProtection
+              - shield:CreateProtection
+              - shield:DeleteProtection
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupIngress
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ec2:CreateSecurityGroup
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - ec2:CreateTags
+            Resource: !Sub arn:${AWS::Partition}:ec2:*:*:security-group/*
+            Condition:
+              StringEquals:
+                ec2:CreateAction: CreateSecurityGroup
+              "Null":
+                aws:RequestTag/elbv2.k8s.aws/cluster: "false"
+          - Effect: Allow
+            Action:
+              - ec2:CreateTags
+              - ec2:DeleteTags
+            Resource: !Sub arn:${AWS::Partition}:ec2:*:*:security-group/*
+            Condition:
+              "Null":
+                aws:RequestTag/elbv2.k8s.aws/cluster: "true"
+                aws:ResourceTag/elbv2.k8s.aws/cluster: "false"
+          - Effect: Allow
+            Action:
+              - ec2:AuthorizeSecurityGroupIngress
+              - ec2:RevokeSecurityGroupIngress
+              - ec2:DeleteSecurityGroup
+            Resource: "*"
+            Condition:
+              "Null":
+                aws:ResourceTag/elbv2.k8s.aws/cluster: "false"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:CreateLoadBalancer
+              - elasticloadbalancing:CreateTargetGroup
+            Resource: "*"
+            Condition:
+              "Null":
+                aws:RequestTag/elbv2.k8s.aws/cluster: "false"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:CreateListener
+              - elasticloadbalancing:DeleteListener
+              - elasticloadbalancing:CreateRule
+              - elasticloadbalancing:DeleteRule
+            Resource: "*"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:AddTags
+              - elasticloadbalancing:RemoveTags
+            Resource:
+              - !Sub arn:${AWS::Partition}:elasticloadbalancing:*:*:targetgroup/*/*
+              - !Sub arn:${AWS::Partition}:elasticloadbalancing:*:*:loadbalancer/net/*/*
+              - !Sub arn:${AWS::Partition}:elasticloadbalancing:*:*:loadbalancer/app/*/*
+            Condition:
+              "Null":
+                aws:RequestTag/elbv2.k8s.aws/cluster: "true"
+                aws:ResourceTag/elbv2.k8s.aws/cluster: "false"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:AddTags
+              - elasticloadbalancing:RemoveTags
+            Resource:
+              - !Sub arn:${AWS::Partition}:elasticloadbalancing:*:*:listener/net/*/*/*
+              - !Sub arn:${AWS::Partition}:elasticloadbalancing:*:*:listener/app/*/*/*
+              - !Sub arn:${AWS::Partition}:elasticloadbalancing:*:*:listener-rule/net/*/*/*
+              - !Sub arn:${AWS::Partition}:elasticloadbalancing:*:*:listener-rule/app/*/*/*
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:ModifyLoadBalancerAttributes
+              - elasticloadbalancing:SetIpAddressType
+              - elasticloadbalancing:SetSecurityGroups
+              - elasticloadbalancing:SetSubnets
+              - elasticloadbalancing:DeleteLoadBalancer
+              - elasticloadbalancing:ModifyTargetGroup
+              - elasticloadbalancing:ModifyTargetGroupAttributes
+              - elasticloadbalancing:DeleteTargetGroup
+              - elasticloadbalancing:ModifyListenerAttributes
+              - elasticloadbalancing:ModifyCapacityReservation
+              - elasticloadbalancing:ModifyIpPools
+            Resource: "*"
+            Condition:
+              "Null":
+                aws:ResourceTag/elbv2.k8s.aws/cluster: "false"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:AddTags
+            Resource:
+              - !Sub arn:${AWS::Partition}:elasticloadbalancing:*:*:targetgroup/*/*
+              - !Sub arn:${AWS::Partition}:elasticloadbalancing:*:*:loadbalancer/net/*/*
+              - !Sub arn:${AWS::Partition}:elasticloadbalancing:*:*:loadbalancer/app/*/*
+            Condition:
+              StringEquals:
+                elasticloadbalancing:CreateAction:
+                  - CreateTargetGroup
+                  - CreateLoadBalancer
+              "Null":
+                aws:RequestTag/elbv2.k8s.aws/cluster: "false"
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:RegisterTargets
+              - elasticloadbalancing:DeregisterTargets
+            Resource: !Sub arn:${AWS::Partition}:elasticloadbalancing:*:*:targetgroup/*/*
+          - Effect: Allow
+            Action:
+              - elasticloadbalancing:SetWebAcl
+              - elasticloadbalancing:ModifyListener
+              - elasticloadbalancing:AddListenerCertificates
+              - elasticloadbalancing:RemoveListenerCertificates
+              - elasticloadbalancing:ModifyRule
+              - elasticloadbalancing:SetRulePriorities
+            Resource: "*"
+
+  LbcRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Fn::Sub:
+          - |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Principal": {"Federated": "${OidcArn}"},
+                  "Action": "sts:AssumeRoleWithWebIdentity",
+                  "Condition": {
+                    "StringEquals": {
+                      "${Issuer}:sub": "system:serviceaccount:kube-system:aws-load-balancer-controller",
+                      "${Issuer}:aud": "sts.amazonaws.com"
+                    }
+                  }
+                }
+              ]
+            }
+          - OidcArn: !Ref EksOidcProvider
+            Issuer: !Select [1, !Split ["https://", !GetAtt EksCluster.OpenIdConnectIssuerUrl]]
+      ManagedPolicyArns:
+        - !Ref LbcPolicy
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # Database secret (Requirements 5.6, 8.3). Defined here, ahead of the other
+  # database resources in task 7.1, because AppRole is scoped to its ARN.
+  # Task 7.1 adds the SecretTargetAttachment that appends host, port, dbname,
+  # and engine.
+  # ---------------------------------------------------------------------------
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${ProjectName}-${Environment}/db
+      Description: !Sub MySQL master credentials for ${ProjectName}-${Environment}
+      KmsKeyId: !Ref SecretsManagerKey
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"admin"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: "\"@/\\'"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # Sample app IRSA role (Requirements 6.12, 8.1). Service account:
+  # webapp/webapp-sa. Reads only the database secret.
+  # ---------------------------------------------------------------------------
+  AppRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Fn::Sub:
+          - |
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Effect": "Allow",
+                  "Principal": {"Federated": "${OidcArn}"},
+                  "Action": "sts:AssumeRoleWithWebIdentity",
+                  "Condition": {
+                    "StringEquals": {
+                      "${Issuer}:sub": "system:serviceaccount:webapp:webapp-sa",
+                      "${Issuer}:aud": "sts.amazonaws.com"
+                    }
+                  }
+                }
+              ]
+            }
+          - OidcArn: !Ref EksOidcProvider
+            Issuer: !Select [1, !Split ["https://", !GetAtt EksCluster.OpenIdConnectIssuerUrl]]
+      Policies:
+        - PolicyName: ReadDatabaseSecret
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref DbSecret
+              - Effect: Allow
+                Action:
+                  - kms:Decrypt
+                Resource: !GetAtt SecretsManagerKey.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ---------------------------------------------------------------------------
+  # Database (Requirements 5.1-5.4, 5.6, 5.8, 5.9, 5.11, 8.2, 8.3, 10.2, 10.4).
+  # DbSecret is defined above. DBName "app" matches the application's dbname
+  # fallback; the attachment copies it into the secret with host, port, engine.
+  # ---------------------------------------------------------------------------
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Private subnets for the RDS MySQL instance
+      SubnetIds:
+        - !Ref PrivateSubnetA
+        - !Ref PrivateSubnetB
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db-subnets
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DbParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Description: MySQL 8.0 slow query logging to file
+      Family: mysql8.0
+      Parameters:
+        slow_query_log: "1"
+        long_query_time: "2"
+        log_output: FILE
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db-params
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DbInstance:
+    Type: AWS::RDS::DBInstance
+    DeletionPolicy: Snapshot
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      Engine: mysql
+      EngineVersion: "8.0"
+      DBInstanceClass: !Ref DbInstanceClass
+      AllocatedStorage: !Ref DbAllocatedStorage
+      StorageType: gp3
+      StorageEncrypted: true
+      KmsKeyId: !GetAtt DbStorageKey.Arn
+      DBName: app
+      MasterUsername: admin
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      MultiAZ: !If [DbMultiAzEnabled, true, false]
+      PubliclyAccessible: false
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      DBParameterGroupName: !Ref DbParameterGroup
+      VPCSecurityGroups:
+        - !Ref DbSecurityGroup
+      BackupRetentionPeriod: 7
+      DeletionProtection: false
+      EnableCloudwatchLogsExports: !If
+        - DbLogExportEnabled
+        - - error
+          - slowquery
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Name
+          Value: !Sub ${ProjectName}-${Environment}-db
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DbSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbSecret
+      TargetId: !Ref DbInstance
+      TargetType: AWS::RDS::DBInstance
+
+  # ---------------------------------------------------------------------------
+  # Manifest_Deployer (Requirements 1.2, 1.5, 1.6, 4.2, 4.5-4.8)
+  # A tiny Lambda starts a CodeBuild project (in the private subnets) that runs
+  # helm and kubectl. The Lambda never answers CloudFormation on success: the
+  # build PUTs the response itself. If the start fails, or if the build ends in
+  # a failure state (EventBridge rule), the Lambda sends FAILED so the stack
+  # does not wait for the one hour custom resource timeout.
+  # ---------------------------------------------------------------------------
+  DeployerFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: start-deployer-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${AWS::StackName}-*
+              - Sid: StartBuild
+                Effect: Allow
+                Action: codebuild:StartBuild
+                Resource: !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/${AWS::StackName}-deployer
+              - Sid: ReadBuild
+                Effect: Allow
+                Action: codebuild:BatchGetBuilds
+                Resource: !Sub arn:${AWS::Partition}:codebuild:${AWS::Region}:${AWS::AccountId}:project/${AWS::StackName}-deployer
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DeployerFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Starts the Manifest_Deployer CodeBuild project and reports build failures to CloudFormation
+      FunctionName: !Sub ${AWS::StackName}-deployer
+      Runtime: python3.12
+      Handler: index.handler
+      Timeout: 60
+      Role: !GetAtt DeployerFunctionRole.Arn
+      Environment:
+        Variables:
+          PROJECT: !Sub ${AWS::StackName}-deployer
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import re
+          import urllib.request as ur
+
+          import boto3
+
+          cb = boto3.client("codebuild")
+          PROJECT = os.environ["PROJECT"]
+
+
+          def put(e, status, reason):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason[:1000],
+                  "PhysicalResourceId": e.get("PhysicalResourceId") or e["LogicalResourceId"],
+                  "StackId": e["StackId"],
+                  "RequestId": e["RequestId"],
+                  "LogicalResourceId": e["LogicalResourceId"],
+                  "Data": {},
+              }).encode()
+              req = ur.Request(e["ResponseURL"], data=body, method="PUT", headers={"Content-Type": ""})
+              ur.urlopen(req, timeout=30).read()
+
+
+          def handler(event, context):
+              print(json.dumps({k: v for k, v in event.items() if k != "ResponseURL"}))
+              if "ResponseURL" in event:
+                  props = event["ResourceProperties"]
+                  env = {
+                      "REQUEST_TYPE": event["RequestType"],
+                      "RESPONSE_URL": event["ResponseURL"],
+                      "STACK_ID": event["StackId"],
+                      "REQUEST_ID": event["RequestId"],
+                      "LOGICAL_RESOURCE_ID": event["LogicalResourceId"],
+                      "PHYSICAL_ID": event.get("PhysicalResourceId") or event["LogicalResourceId"],
+                  }
+                  for k, v in props.items():
+                      if k != "ServiceToken" and str(v) != "":
+                          env[re.sub(r"(?<!^)(?=[A-Z])", "_", k).upper()] = str(v)
+                  try:
+                      cb.start_build(
+                          projectName=PROJECT,
+                          environmentVariablesOverride=[
+                              {"name": n, "value": v, "type": "PLAINTEXT"} for n, v in env.items()
+                          ],
+                      )
+                  except Exception as ex:
+                      if event["RequestType"] == "Delete":
+                          put(event, "SUCCESS", "Delete: build not started: %s" % ex)
+                      else:
+                          put(event, "FAILED", "Could not start deployer build: %s" % ex)
+                  return
+              detail = event["detail"]
+              build = cb.batch_get_builds(ids=[detail["build-id"]])["builds"][0]
+              env = {v["name"]: v["value"] for v in build["environment"]["environmentVariables"]}
+              if "RESPONSE_URL" in env:
+                  e = {
+                      "ResponseURL": env["RESPONSE_URL"],
+                      "StackId": env["STACK_ID"],
+                      "RequestId": env["REQUEST_ID"],
+                      "LogicalResourceId": env["LOGICAL_RESOURCE_ID"],
+                      "PhysicalResourceId": env.get("PHYSICAL_ID"),
+                  }
+                  put(e, "FAILED", "Deployer build ended with status %s. Build: %s" % (detail["build-status"], detail["build-id"]))
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DeployerBuildRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: codebuild.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: deployer-build
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource:
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-deployer
+                  - !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/codebuild/${AWS::StackName}-deployer:*
+              - Sid: DescribeCluster
+                Effect: Allow
+                Action: eks:DescribeCluster
+                Resource: !GetAtt EksCluster.Arn
+              - Sid: DescribeAddons
+                Effect: Allow
+                Action:
+                  - eks:ListAddons
+                  - eks:DescribeAddon
+                Resource:
+                  - !GetAtt EksCluster.Arn
+                  - !Sub arn:${AWS::Partition}:eks:${AWS::Region}:${AWS::AccountId}:addon/${EksCluster}/*/*
+              - Sid: VpcNetworkInterfaces
+                Effect: Allow
+                Action:
+                  - ec2:CreateNetworkInterface
+                  - ec2:DeleteNetworkInterface
+                Resource: "*"
+              - Sid: VpcNetworkInterfacePermission
+                Effect: Allow
+                Action: ec2:CreateNetworkInterfacePermission
+                Resource: !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:network-interface/*
+                Condition:
+                  StringEquals:
+                    ec2:AuthorizedService: codebuild.amazonaws.com
+                  ArnEquals:
+                    ec2:Subnet:
+                      - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnetA}
+                      - !Sub arn:${AWS::Partition}:ec2:${AWS::Region}:${AWS::AccountId}:subnet/${PrivateSubnetB}
+              - Sid: DescribeNetwork
+                Effect: Allow
+                Action:
+                  - ec2:DescribeDhcpOptions
+                  - ec2:DescribeNetworkInterfaces
+                  - ec2:DescribeSecurityGroups
+                  - ec2:DescribeSubnets
+                  - ec2:DescribeVpcs
+                Resource: "*"
+              - Sid: DescribeLoadBalancers
+                Effect: Allow
+                Action: elasticloadbalancing:Describe*
+                Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  DeployerAccessEntry:
+    Type: AWS::EKS::AccessEntry
+    Properties:
+      ClusterName: !Ref EksCluster
+      PrincipalArn: !GetAtt DeployerBuildRole.Arn
+      Type: STANDARD
+      AccessPolicies:
+        - PolicyArn: !Sub arn:${AWS::Partition}:eks::aws:cluster-access-policy/AmazonEKSClusterAdminPolicy
+          AccessScope:
+            Type: cluster
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  # The buildspec is a plain literal block (no Fn::Sub) so shell ${VAR} syntax is
+  # not interpreted by CloudFormation. Template values reach it only through the
+  # environment variables that DeployerFunction sets (see the Deployer request).
+  # Flow: install phase writes /tmp/manifests.tpl, /tmp/respond.py and
+  # /tmp/stage.sh. The build phase runs stage.sh, which records /tmp/status,
+  # /tmp/reason and /tmp/alb_host. post_build always sends the CloudFormation
+  # response from those files.
+  DeployerProject:
+    Type: AWS::CodeBuild::Project
+    DependsOn: DeployerAccessEntry
+    Properties:
+      Name: !Sub ${AWS::StackName}-deployer
+      Description: Manifest_Deployer. Runs helm and kubectl against the private EKS cluster.
+      ServiceRole: !GetAtt DeployerBuildRole.Arn
+      TimeoutInMinutes: 40
+      Artifacts:
+        Type: NO_ARTIFACTS
+      Environment:
+        Type: LINUX_CONTAINER
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:7.0
+      VpcConfig:
+        VpcId: !Ref Vpc
+        Subnets:
+          - !Ref PrivateSubnetA
+          - !Ref PrivateSubnetB
+        SecurityGroupIds:
+          - !Ref DeployerSecurityGroup
+      Source:
+        Type: NO_SOURCE
+        BuildSpec: |
+          version: 0.2
+          env:
+            shell: bash
+            variables:
+              HELM_VERSION: "v3.18.4"
+              LBC_CHART_VERSION: "1.14.0"
+          phases:
+            install:
+              commands:
+                - |
+                  # ---- MANIFESTS_PLACEHOLDER BEGIN (task 8.3 replaces the content) ----
+                  # Manifest template. stage.sh renders it with envsubst, substituting only an
+                  # explicit variable list, into /tmp/manifests.yaml. No credentials appear here.
+                  cat > /tmp/manifests.tpl <<'MANIFESTS_EOF'
+                  apiVersion: v1
+                  kind: Namespace
+                  metadata:
+                    name: webapp
+                  ---
+                  apiVersion: v1
+                  kind: ServiceAccount
+                  metadata:
+                    name: webapp-sa
+                    namespace: webapp
+                    annotations:
+                      eks.amazonaws.com/role-arn: "${APP_ROLE_ARN}"
+                  ---
+                  apiVersion: v1
+                  kind: ConfigMap
+                  metadata:
+                    name: webapp-code
+                    namespace: webapp
+                  data:
+                    app.py: |
+                      import json, os, sys, time, html, datetime
+                      from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+                      SEED = [("Alpha", "First sample item"), ("Bravo", "Second sample item"), ("Charlie", "Third sample item"),
+                              ("Delta", "Fourth sample item"), ("Echo", "Fifth sample item")]
+                      DDL = ("CREATE TABLE items (id INT AUTO_INCREMENT PRIMARY KEY, name VARCHAR(100) NOT NULL, "
+                             "description VARCHAR(255), created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)")
+                      CFG = {}
+
+
+                      def format_log(level, msg):
+                          ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+                          return json.dumps({"timestamp": ts, "level": level, "message": str(msg)})
+
+
+                      def log(level, msg):
+                          print(format_log(level, msg), flush=True)
+
+
+                      def render_page(rows):
+                          e = lambda v: html.escape("" if v is None else str(v))
+                          li = "".join("<li>%s: <b>%s</b> - %s (%s)</li>" % (e(r[0]), e(r[1]), e(r[2]), e(r[3])) for r in rows)
+                          return "<!doctype html><html><head><title>Items</title></head><body><h1>Items</h1><ul>%s</ul></body></html>" % li
+
+
+                      def render_error():
+                          return ("<!doctype html><html><head><title>Error</title></head><body><h1>Service unavailable</h1>"
+                                  "<p>The service is temporarily unavailable. Please try again later.</p></body></html>")
+
+
+                      def load_secret():
+                          import boto3
+                          c = boto3.client("secretsmanager", region_name=os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION"))
+                          return json.loads(c.get_secret_value(SecretId=os.environ["DB_SECRET_ARN"])["SecretString"])
+
+
+                      def connect(timeout=5, db=True):
+                          import pymysql
+                          s = CFG["secret"]
+                          return pymysql.connect(host=s["host"], port=int(s.get("port", 3306)), user=s["username"], password=s["password"],
+                                                 database=CFG["db"] if db else None, connect_timeout=timeout,
+                                                 read_timeout=timeout, write_timeout=timeout)
+
+
+                      def seed(conn):
+                          cur = conn.cursor()
+                          cur.execute("SELECT GET_LOCK('seed', 10)")
+                          if cur.fetchone()[0] != 1:
+                              raise RuntimeError("could not obtain seed lock")
+                          try:
+                              cur.execute("CREATE DATABASE IF NOT EXISTS `%s`" % CFG["db"].replace("`", ""))
+                              conn.select_db(CFG["db"])
+                              cur.execute("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name='items'")
+                              if cur.fetchone()[0] == 0:
+                                  cur.execute(DDL)
+                                  cur.executemany("INSERT INTO items (name, description) VALUES (%s, %s)", SEED)
+                                  conn.commit()
+                                  log("INFO", "created table items and inserted %d seed rows" % len(SEED))
+                          finally:
+                              cur.execute("SELECT RELEASE_LOCK('seed')")
+                              cur.fetchall()
+
+
+                      def startup(sleep=time.sleep):
+                          CFG["secret"] = load_secret()
+                          CFG["db"] = CFG["secret"].get("dbname") or "app"
+                          for attempt in range(1, 13):
+                              try:
+                                  conn = connect(10, db=False)
+                                  break
+                              except Exception as ex:
+                                  log("ERROR", "db connect attempt %d/12 failed: %s" % (attempt, type(ex).__name__))
+                                  if attempt == 12:
+                                      sys.exit(1)
+                                  sleep(5)
+                          try:
+                              seed(conn)
+                          finally:
+                              conn.close()
+
+
+                      def query(sql, timeout):
+                          conn = connect(timeout)
+                          try:
+                              cur = conn.cursor()
+                              cur.execute(sql)
+                              return cur.fetchall()
+                          finally:
+                              conn.close()
+
+
+                      class Handler(BaseHTTPRequestHandler):
+                          def log_message(self, fmt, *args):
+                              pass
+
+                          def reply(self, code, body, ctype="text/html; charset=utf-8"):
+                              data = body.encode()
+                              self.send_response(code)
+                              self.send_header("Content-Type", ctype)
+                              self.send_header("Content-Length", str(len(data)))
+                              self.end_headers()
+                              self.wfile.write(data)
+                              log("INFO" if code < 500 else "ERROR", "%s %s -> %d" % (self.command, self.path, code))
+
+                          def do_GET(self):
+                              path = self.path.split("?")[0]
+                              if path == "/healthz":
+                                  try:
+                                      query("SELECT 1", 2)
+                                      self.reply(200, "ok", "text/plain")
+                                  except Exception as ex:
+                                      log("ERROR", "health check failed: %s" % type(ex).__name__)
+                                      self.reply(503, "unavailable", "text/plain")
+                              elif path == "/":
+                                  try:
+                                      rows = query("SELECT id, name, description, created_at FROM items ORDER BY id LIMIT 100", 5)
+                                      self.reply(200, render_page(rows))
+                                  except Exception as ex:
+                                      log("ERROR", "query failed: %s" % type(ex).__name__)
+                                      self.reply(503, render_error())
+                              else:
+                                  self.reply(404, "not found", "text/plain")
+
+
+                      if __name__ == "__main__":
+                          startup()
+                          ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+                  ---
+                  apiVersion: apps/v1
+                  kind: Deployment
+                  metadata:
+                    name: webapp
+                    namespace: webapp
+                    labels:
+                      app: webapp
+                  spec:
+                    replicas: ${REPLICAS}
+                    selector:
+                      matchLabels:
+                        app: webapp
+                    template:
+                      metadata:
+                        labels:
+                          app: webapp
+                      spec:
+                        serviceAccountName: webapp-sa
+                        securityContext:
+                          runAsNonRoot: true
+                          runAsUser: 10001
+                          runAsGroup: 10001
+                          fsGroup: 10001
+                          seccompProfile:
+                            type: RuntimeDefault
+                        topologySpreadConstraints:
+                          - maxSkew: 1
+                            topologyKey: topology.kubernetes.io/zone
+                            whenUnsatisfiable: DoNotSchedule
+                            labelSelector:
+                              matchLabels:
+                                app: webapp
+                        initContainers:
+                          - name: deps
+                            image: python:3.12-slim
+                            command:
+                              - pip
+                              - install
+                              - --no-cache-dir
+                              - --target
+                              - /deps
+                              - pymysql
+                              - boto3
+                            env:
+                              - name: HOME
+                                value: /tmp
+                              - name: PIP_CACHE_DIR
+                                value: /tmp/pip
+                              - name: PYTHONDONTWRITEBYTECODE
+                                value: "1"
+                            securityContext:
+                              readOnlyRootFilesystem: true
+                              allowPrivilegeEscalation: false
+                              capabilities:
+                                drop:
+                                  - ALL
+                            resources:
+                              requests:
+                                cpu: 100m
+                                memory: 128Mi
+                              limits:
+                                cpu: 500m
+                                memory: 256Mi
+                            volumeMounts:
+                              - name: tmp
+                                mountPath: /tmp
+                              - name: deps
+                                mountPath: /deps
+                        containers:
+                          - name: app
+                            image: python:3.12-slim
+                            command:
+                              - python
+                              - /app/app.py
+                            ports:
+                              - name: http
+                                containerPort: 8080
+                            env:
+                              - name: PYTHONPATH
+                                value: /deps
+                              - name: PYTHONUNBUFFERED
+                                value: "1"
+                              - name: PYTHONDONTWRITEBYTECODE
+                                value: "1"
+                              - name: HOME
+                                value: /tmp
+                              - name: DB_SECRET_ARN
+                                value: "${DB_SECRET_ARN}"
+                              - name: AWS_REGION
+                                value: "${REGION}"
+                              - name: AWS_DEFAULT_REGION
+                                value: "${REGION}"
+                            securityContext:
+                              readOnlyRootFilesystem: true
+                              allowPrivilegeEscalation: false
+                              capabilities:
+                                drop:
+                                  - ALL
+                            resources:
+                              requests:
+                                cpu: 100m
+                                memory: 128Mi
+                              limits:
+                                cpu: 500m
+                                memory: 256Mi
+                            # The startup probe gives the app up to 5 minutes to connect to the
+                            # database; liveness and readiness only begin after it succeeds.
+                            startupProbe:
+                              httpGet:
+                                path: /healthz
+                                port: 8080
+                              periodSeconds: 10
+                              timeoutSeconds: 3
+                              failureThreshold: 30
+                            livenessProbe:
+                              httpGet:
+                                path: /healthz
+                                port: 8080
+                              periodSeconds: 10
+                              timeoutSeconds: 3
+                              failureThreshold: 3
+                            readinessProbe:
+                              httpGet:
+                                path: /healthz
+                                port: 8080
+                              periodSeconds: 10
+                              timeoutSeconds: 3
+                              failureThreshold: 3
+                            volumeMounts:
+                              - name: tmp
+                                mountPath: /tmp
+                              - name: deps
+                                mountPath: /deps
+                                readOnly: true
+                              - name: code
+                                mountPath: /app
+                                readOnly: true
+                        volumes:
+                          - name: tmp
+                            emptyDir: {}
+                          - name: deps
+                            emptyDir: {}
+                          - name: code
+                            configMap:
+                              name: webapp-code
+                  ---
+                  apiVersion: v1
+                  kind: Service
+                  metadata:
+                    name: webapp
+                    namespace: webapp
+                  spec:
+                    type: ClusterIP
+                    selector:
+                      app: webapp
+                    ports:
+                      - name: http
+                        port: 80
+                        targetPort: 8080
+                  ---
+                  apiVersion: networking.k8s.io/v1
+                  kind: Ingress
+                  metadata:
+                    name: webapp
+                    namespace: webapp
+                    annotations:
+                      alb.ingress.kubernetes.io/scheme: internet-facing
+                      alb.ingress.kubernetes.io/target-type: ip
+                      alb.ingress.kubernetes.io/subnets: "${PUBLIC_SUBNET_IDS}"
+                      alb.ingress.kubernetes.io/security-groups: "${ALB_SG_ID}"
+                      alb.ingress.kubernetes.io/manage-backend-security-group-rules: "false"
+                      alb.ingress.kubernetes.io/healthcheck-path: /healthz
+                      alb.ingress.kubernetes.io/healthcheck-interval-seconds: "15"
+                      alb.ingress.kubernetes.io/healthcheck-timeout-seconds: "5"
+                      alb.ingress.kubernetes.io/healthy-threshold-count: "2"
+                      alb.ingress.kubernetes.io/unhealthy-threshold-count: "3"
+                      alb.ingress.kubernetes.io/success-codes: "200"
+                      alb.ingress.kubernetes.io/listen-ports: '${LISTEN_PORTS}'
+                  ${INGRESS_TLS_ANNOTATIONS}
+                  spec:
+                    ingressClassName: alb
+                    rules:
+                      - http:
+                          paths:
+                            - path: /
+                              pathType: Prefix
+                              backend:
+                                service:
+                                  name: webapp
+                                  port:
+                                    number: 80
+                  MANIFESTS_EOF
+                  # ---- MANIFESTS_PLACEHOLDER END ----
+                - |
+                  cat > /tmp/respond.py <<'RESPOND_EOF'
+                  import json
+                  import os
+                  import sys
+                  import time
+                  import urllib.request as ur
+
+
+                  def rd(path):
+                      try:
+                          with open(path) as f:
+                              return f.read().strip()
+                      except OSError:
+                          return ""
+
+
+                  status = rd("/tmp/status")
+                  if status not in ("SUCCESS", "FAILED"):
+                      status = "FAILED"
+                  reason = rd("/tmp/reason")
+                  if not reason:
+                      reason = "Deployer build did not complete"
+                  if status == "FAILED":
+                      reason = "%s (build %s)" % (reason, os.environ.get("CODEBUILD_BUILD_ID", "unknown"))
+                  data = {}
+                  if (status == "SUCCESS" and os.environ.get("STAGE") == "app"
+                          and os.environ.get("REQUEST_TYPE") in ("Create", "Update")):
+                      data["AlbHostname"] = rd("/tmp/alb_host")
+                  url = os.environ.get("RESPONSE_URL", "")
+                  if not url:
+                      print("RESPONSE_URL is not set; cannot respond. status=%s reason=%s" % (status, reason))
+                      sys.exit(1)
+                  body = json.dumps({
+                      "Status": status,
+                      "Reason": reason[:1000],
+                      "PhysicalResourceId": os.environ.get("PHYSICAL_ID") or os.environ["LOGICAL_RESOURCE_ID"],
+                      "StackId": os.environ["STACK_ID"],
+                      "RequestId": os.environ["REQUEST_ID"],
+                      "LogicalResourceId": os.environ["LOGICAL_RESOURCE_ID"],
+                      "Data": data,
+                  }).encode()
+                  last = None
+                  for attempt in range(5):
+                      try:
+                          req = ur.Request(url, data=body, method="PUT", headers={"Content-Type": ""})
+                          print("Response sent, HTTP %s: %s" % (ur.urlopen(req, timeout=30).status, status))
+                          sys.exit(0)
+                      except SystemExit:
+                          raise
+                      except Exception as ex:
+                          last = ex
+                          print("PUT attempt %d failed: %s" % (attempt + 1, ex))
+                          time.sleep(5)
+                  print("Could not send the response: %s" % last)
+                  sys.exit(1)
+                  RESPOND_EOF
+                - |
+                  cat > /tmp/stage.sh <<'STAGE_EOF'
+                  #!/bin/bash
+                  set -uo pipefail
+                  STEP="init"
+                  : > /tmp/status
+                  : > /tmp/reason
+                  : > /tmp/alb_host
+                  fail() { echo FAILED > /tmp/status; echo "$1" > /tmp/reason; echo "FAILED: $1"; exit 1; }
+                  ok() { echo SUCCESS > /tmp/status; echo "${1:-done}" > /tmp/reason; echo "SUCCESS: ${1:-done}"; exit 0; }
+                  trap 'if [ ! -s /tmp/status ]; then echo FAILED > /tmp/status; echo "Unexpected error during: $STEP" > /tmp/reason; fi' EXIT
+
+                  STAGE="${STAGE:-}"
+                  REQUEST_TYPE="${REQUEST_TYPE:-}"
+                  CLUSTER_NAME="${CLUSTER_NAME:-}"
+                  REGION="${REGION:-}"
+                  VPC_ID="${VPC_ID:-}"
+                  LBC_ROLE_ARN="${LBC_ROLE_ARN:-}"
+                  PUBLIC_SUBNET_IDS="${PUBLIC_SUBNET_IDS:-}"
+                  ALB_SG_ID="${ALB_SG_ID:-}"
+                  APP_ROLE_ARN="${APP_ROLE_ARN:-}"
+                  DB_SECRET_ARN="${DB_SECRET_ARN:-}"
+                  CERTIFICATE_ARN="${CERTIFICATE_ARN:-}"
+                  REPLICAS="${REPLICAS:-}"
+                  export STAGE REQUEST_TYPE CLUSTER_NAME REGION VPC_ID LBC_ROLE_ARN PUBLIC_SUBNET_IDS ALB_SG_ID APP_ROLE_ARN DB_SECRET_ARN CERTIFICATE_ARN REPLICAS
+                  export AWS_DEFAULT_REGION="$REGION"
+
+                  IS_DELETE=0
+                  [ "$REQUEST_TYPE" = "Delete" ] && IS_DELETE=1
+
+                  STEP="validate inputs"
+                  case "$STAGE" in
+                    addons) NEEDED="CLUSTER_NAME REGION REQUEST_TYPE" ; [ $IS_DELETE = 1 ] || NEEDED="$NEEDED VPC_ID LBC_ROLE_ARN" ;;
+                    app)    NEEDED="CLUSTER_NAME REGION REQUEST_TYPE" ; [ $IS_DELETE = 1 ] || NEEDED="$NEEDED VPC_ID PUBLIC_SUBNET_IDS ALB_SG_ID APP_ROLE_ARN DB_SECRET_ARN REPLICAS" ;;
+                    *)      fail "Deployer: unknown stage '$STAGE'" ;;
+                  esac
+                  for v in $NEEDED; do
+                    [ -n "${!v:-}" ] || fail "Deployer: required parameter $v is missing for stage $STAGE"
+                  done
+
+                  # Unreachable cluster: success on delete (a rolled-back create must be deletable).
+                  skip_or_fail() { # message
+                    if [ $IS_DELETE = 1 ]; then ok "$1; nothing to clean up"; fi
+                    fail "$1"
+                  }
+
+                  STEP="EKS cluster lookup"
+                  if ! CLUSTER_VERSION=$(aws eks describe-cluster --name "$CLUSTER_NAME" --region "$REGION" --query cluster.version --output text 2>/tmp/err); then
+                    skip_or_fail "EKS cluster $CLUSTER_NAME not available: $(head -c 300 /tmp/err)"
+                  fi
+
+                  ARCH=$(uname -m)
+                  case "$ARCH" in x86_64) ARCH=amd64 ;; aarch64) ARCH=arm64 ;; esac
+
+                  install_tools() {
+                    STEP="install helm $HELM_VERSION"
+                    local f="helm-${HELM_VERSION}-linux-${ARCH}.tar.gz"
+                    curl -fsSL "https://get.helm.sh/$f" -o "/tmp/$f" || return 1
+                    curl -fsSL "https://get.helm.sh/$f.sha256sum" -o "/tmp/$f.sha256sum" || return 1
+                    (cd /tmp && sha256sum -c "$f.sha256sum") || return 1
+                    tar -xzf "/tmp/$f" -C /tmp "linux-${ARCH}/helm" || return 1
+                    install -m 0755 "/tmp/linux-${ARCH}/helm" /usr/local/bin/helm || return 1
+                    # kubectl: latest patch of the cluster's minor version (within the supported skew), checksum verified.
+                    STEP="install kubectl for Kubernetes $CLUSTER_VERSION"
+                    local kv
+                    kv=$(curl -fsSL "https://dl.k8s.io/release/stable-${CLUSTER_VERSION}.txt") || kv=$(curl -fsSL https://dl.k8s.io/release/stable.txt) || return 1
+                    curl -fsSL "https://dl.k8s.io/release/${kv}/bin/linux/${ARCH}/kubectl" -o /tmp/kubectl || return 1
+                    curl -fsSL "https://dl.k8s.io/release/${kv}/bin/linux/${ARCH}/kubectl.sha256" -o /tmp/kubectl.sha256 || return 1
+                    echo "$(cat /tmp/kubectl.sha256)  /tmp/kubectl" | sha256sum -c - || return 1
+                    install -m 0755 /tmp/kubectl /usr/local/bin/kubectl || return 1
+                  }
+                  if ! install_tools; then
+                    skip_or_fail "Deployer tooling: failed during '$STEP'"
+                  fi
+
+                  STEP="aws eks update-kubeconfig"
+                  if ! aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$REGION" >/dev/null 2>/tmp/err; then
+                    skip_or_fail "EKS cluster $CLUSTER_NAME: update-kubeconfig failed: $(head -c 300 /tmp/err)"
+                  fi
+                  if [ $IS_DELETE = 1 ]; then
+                    STEP="cluster API check"
+                    kubectl get namespace kube-system --request-timeout=30s >/dev/null 2>/tmp/err || ok "EKS cluster API not reachable ($(head -c 200 /tmp/err))"
+                  fi
+
+                  ADDONS="vpc-cni coredns kube-proxy aws-ebs-csi-driver"
+                  sel_for() {
+                    case "$1" in
+                      vpc-cni) echo "k8s-app=aws-node" ;;
+                      coredns) echo "k8s-app=kube-dns" ;;
+                      kube-proxy) echo "k8s-app=kube-proxy" ;;
+                      aws-ebs-csi-driver) echo "app.kubernetes.io/name=aws-ebs-csi-driver" ;;
+                      lbc) echo "app.kubernetes.io/name=aws-load-balancer-controller" ;;
+                    esac
+                  }
+                  now() { date +%s; }
+
+                  # ------------------------------------------------------------------ addons
+                  if [ "$STAGE" = "addons" ]; then
+                    if [ $IS_DELETE = 1 ]; then
+                      STEP="helm uninstall aws-load-balancer-controller"
+                      helm uninstall aws-load-balancer-controller -n kube-system --timeout 5m || echo "helm uninstall failed or release absent; continuing"
+                      ok "AWS Load Balancer Controller uninstalled (best effort)"
+                    fi
+
+                    STEP="AWS Load Balancer Controller"
+                    helm repo add eks https://aws.github.io/eks-charts >/dev/null 2>/tmp/err || fail "AWS Load Balancer Controller: helm repo add failed: $(head -c 300 /tmp/err)"
+                    helm repo update >/dev/null 2>&1
+                    if ! helm upgrade --install aws-load-balancer-controller eks/aws-load-balancer-controller \
+                        --version "$LBC_CHART_VERSION" -n kube-system \
+                        --set "clusterName=${CLUSTER_NAME}" \
+                        --set serviceAccount.create=true \
+                        --set serviceAccount.name=aws-load-balancer-controller \
+                        --set "serviceAccount.annotations.eks\.amazonaws\.com/role-arn=${LBC_ROLE_ARN}" \
+                        --set "vpcId=${VPC_ID}" \
+                        --set "region=${REGION}" \
+                        --wait --timeout 15m 2>/tmp/err; then
+                      fail "AWS Load Balancer Controller: helm install failed or was not ready within 15 minutes: $(tail -c 400 /tmp/err)"
+                    fi
+
+                    DEADLINE=$(( $(now) + 900 ))
+                    for a in $ADDONS; do
+                      STEP="EKS add-on $a status"
+                      while true; do
+                        S=$(aws eks describe-addon --cluster-name "$CLUSTER_NAME" --addon-name "$a" --region "$REGION" --query addon.status --output text 2>/tmp/err) || S="ERROR: $(head -c 200 /tmp/err)"
+                        [ "$S" = "ACTIVE" ] && break
+                        case "$S" in CREATE_FAILED|UPDATE_FAILED) fail "EKS add-on $a: status $S" ;; esac
+                        [ "$(now)" -ge "$DEADLINE" ] && fail "EKS add-on $a: not ACTIVE within 15 minutes (status: $S)"
+                        sleep 15
+                      done
+                      echo "add-on $a is ACTIVE"
+                    done
+
+                    for c in vpc-cni coredns kube-proxy aws-ebs-csi-driver lbc; do
+                      STEP="pods of $c"
+                      SEL=$(sel_for "$c")
+                      NAME="$c"
+                      [ "$c" = "lbc" ] && NAME="AWS Load Balancer Controller"
+                      LEFT=$(( DEADLINE - $(now) ))
+                      [ "$LEFT" -lt 60 ] && LEFT=60
+                      kubectl wait --for=condition=Ready pod -l "$SEL" -n kube-system --timeout="${LEFT}s" 2>/tmp/err || fail "$NAME: pods ($SEL) not Ready in kube-system: $(tail -c 300 /tmp/err)"
+                      BAD=$(kubectl get pods -n kube-system -l "$SEL" -o jsonpath='{range .items[*]}{.metadata.name}={.status.phase}{"\n"}{end}' | grep -v '=Running$' || true)
+                      [ -z "$BAD" ] || fail "$NAME: pods not Running: $(echo "$BAD" | head -c 300)"
+                    done
+                    ok "Add-ons and AWS Load Balancer Controller are healthy"
+                  fi
+
+                  # --------------------------------------------------------------------- app
+                  if [ "$STAGE" = "app" ] && [ $IS_DELETE = 0 ]; then
+                    STEP="preflight AWS Load Balancer Controller"
+                    kubectl get deployment aws-load-balancer-controller -n kube-system >/dev/null 2>/tmp/err || fail "AWS Load Balancer Controller: deployment not found in kube-system"
+                    kubectl rollout status deployment/aws-load-balancer-controller -n kube-system --timeout=120s >/dev/null 2>&1 || fail "AWS Load Balancer Controller: deployment not ready"
+                    for a in $ADDONS; do
+                      STEP="preflight add-on $a"
+                      S=$(aws eks describe-addon --cluster-name "$CLUSTER_NAME" --addon-name "$a" --region "$REGION" --query addon.status --output text 2>/dev/null) || fail "EKS add-on $a: not installed"
+                      [ "$S" = "ACTIVE" ] || fail "EKS add-on $a: status is $S, expected ACTIVE"
+                    done
+
+                    STEP="render manifests"
+                    command -v envsubst >/dev/null 2>&1 || apt-get install -y gettext-base >/dev/null 2>&1
+                    # Ingress variant: HTTPS adds the certificate and redirect annotations.
+                    # envsubst has no conditionals, so they are built here as YAML lines.
+                    LISTEN_PORTS='[{"HTTP":80}]'
+                    INGRESS_TLS_ANNOTATIONS=""
+                    if [ -n "$CERTIFICATE_ARN" ]; then
+                      LISTEN_PORTS='[{"HTTP":80},{"HTTPS":443}]'
+                      INGRESS_TLS_ANNOTATIONS="    alb.ingress.kubernetes.io/certificate-arn: \"${CERTIFICATE_ARN}\"
+                      alb.ingress.kubernetes.io/ssl-redirect: \"443\""
+                    fi
+                    export LISTEN_PORTS INGRESS_TLS_ANNOTATIONS
+                    # Explicit variable list: any other $word in the template is left untouched.
+                    envsubst '${CLUSTER_NAME} ${REGION} ${VPC_ID} ${PUBLIC_SUBNET_IDS} ${ALB_SG_ID} ${APP_ROLE_ARN} ${DB_SECRET_ARN} ${CERTIFICATE_ARN} ${REPLICAS} ${LISTEN_PORTS} ${INGRESS_TLS_ANNOTATIONS}' < /tmp/manifests.tpl > /tmp/manifests.yaml || fail "Kubernetes manifests: rendering failed"
+                    STEP="apply manifests"
+                    kubectl apply -f /tmp/manifests.yaml 2>/tmp/err || fail "Kubernetes manifests: kubectl apply failed: $(tail -c 400 /tmp/err)"
+
+                    if kubectl get ingress webapp -n webapp >/dev/null 2>&1; then
+                      STEP="wait for Ingress hostname"
+                      DEADLINE=$(( $(now) + 900 ))
+                      while true; do
+                        H=$(kubectl get ingress webapp -n webapp -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)
+                        [ -n "$H" ] && break
+                        [ "$(now)" -ge "$DEADLINE" ] && fail "Ingress webapp: no ALB hostname after 15 minutes"
+                        sleep 15
+                      done
+                      echo "$H" > /tmp/alb_host
+                    fi
+                    ok "Application manifests applied"
+                  fi
+
+                  if [ "$STAGE" = "app" ] && [ $IS_DELETE = 1 ]; then
+                    STEP="delete Ingress"
+                    kubectl delete ingress -n webapp --all --ignore-not-found --wait=true --timeout=5m || echo "ingress delete did not finish cleanly; checking ALB state"
+
+                    if [ -n "$ALB_SG_ID" ]; then
+                      STEP="wait for ALB removal"
+                      DEADLINE=$(( $(now) + 900 ))
+                      while true; do
+                        LBS=$(aws elbv2 describe-load-balancers --region "$REGION" --query "LoadBalancers[?SecurityGroups!=null && contains(SecurityGroups, '${ALB_SG_ID}')].LoadBalancerArn" --output text 2>/tmp/err) || { echo "describe-load-balancers failed: $(head -c 200 /tmp/err)"; LBS="?"; }
+                        [ -z "$LBS" ] && break
+                        [ "$(now)" -ge "$DEADLINE" ] && fail "Application Load Balancer: still present 15 minutes after Ingress deletion ($LBS)"
+                        sleep 15
+                      done
+
+                      STEP="wait for ALB network interfaces"
+                      DEADLINE=$(( $(now) + 900 ))
+                      while true; do
+                        ENIS=$(aws ec2 describe-network-interfaces --region "$REGION" --filters "Name=group-id,Values=${ALB_SG_ID}" --query 'NetworkInterfaces[].NetworkInterfaceId' --output text 2>/tmp/err) || { echo "describe-network-interfaces failed: $(head -c 200 /tmp/err)"; ENIS="?"; }
+                        [ -z "$ENIS" ] && break
+                        [ "$(now)" -ge "$DEADLINE" ] && fail "ALB security group $ALB_SG_ID: network interfaces still present after 15 minutes ($ENIS)"
+                        sleep 15
+                      done
+                    fi
+
+                    STEP="delete namespace webapp"
+                    kubectl delete namespace webapp --ignore-not-found --wait=true --timeout=10m 2>/tmp/err || fail "Namespace webapp: deletion did not complete: $(tail -c 300 /tmp/err)"
+                    ok "Ingress, ALB, network interfaces and namespace removed"
+                  fi
+                  fail "Deployer: nothing to do for stage $STAGE and request $REQUEST_TYPE"
+                  STAGE_EOF
+            build:
+              commands:
+                - bash /tmp/stage.sh || true
+            post_build:
+              commands:
+                - python3 /tmp/respond.py
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  BuildFailureRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Reports failed Manifest_Deployer builds to CloudFormation
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.codebuild
+        detail-type:
+          - CodeBuild Build State Change
+        detail:
+          build-status:
+            - FAILED
+            - FAULT
+            - TIMED_OUT
+            - STOPPED
+          project-name:
+            - !Ref DeployerProject
+      Targets:
+        - Id: DeployerFunction
+          Arn: !GetAtt DeployerFunction.Arn
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectName
+        - Key: Environment
+          Value: !Ref Environment
+
+  BuildFailureRulePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref DeployerFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BuildFailureRule.Arn
+
+  AddonsStage:
+    Type: Custom::DeployerAddons
+    DependsOn:
+      - CoreDnsAddon
+      - EbsCsiAddon
+      - NodeGroup
+      - LbcRole
+      - DeployerProject
+      - BuildFailureRule
+      - BuildFailureRulePermission
+      - DeployerAccessEntry
+    Properties:
+      ServiceToken: !GetAtt DeployerFunction.Arn
+      Stage: addons
+      ClusterName: !Ref EksCluster
+      Region: !Ref AWS::Region
+      VpcId: !Ref Vpc
+      LbcRoleArn: !GetAtt LbcRole.Arn
+
+  AppStage:
+    Type: Custom::DeployerApp
+    DependsOn:
+      - AddonsStage
+      - DbSecretAttachment
+      - AlbSecurityGroup
+    Properties:
+      ServiceToken: !GetAtt DeployerFunction.Arn
+      Stage: app
+      ClusterName: !Ref EksCluster
+      Region: !Ref AWS::Region
+      VpcId: !Ref Vpc
+      PublicSubnetIds: !Join [",", [!Ref PublicSubnetA, !Ref PublicSubnetB]]
+      AlbSgId: !GetAtt AlbSecurityGroup.GroupId
+      AppRoleArn: !GetAtt AppRole.Arn
+      DbSecretArn: !Ref DbSecret
+      CertificateArn: !Ref CertificateArn
+      Replicas: !Ref AppReplicas
+
+Outputs:
+  ApplicationUrl:
+    Description: Public URL of the application load balancer
+    Value: !Sub
+      - "${Scheme}://${Host}"
+      - Scheme: !If [HasCertificate, https, http]
+        Host: !GetAtt AppStage.AlbHostname
+  ClusterName:
+    Description: Name of the EKS cluster
+    Value: !Ref EksCluster
+  DatabaseEndpoint:
+    Description: Endpoint address of the RDS for MySQL instance
+    Value: !GetAtt DbInstance.Endpoint.Address
+  DatabaseSecretArn:
+    Description: ARN of the Secrets Manager secret holding the database credentials
+    Value: !Ref DbSecret
+  KubeconfigCommand:
+    Description: Command that configures kubectl for the cluster
+    Value: !Sub aws eks update-kubeconfig --name ${EksCluster} --region ${AWS::Region}

@@ -2,4 +2,4 @@ pytest
 PyYAML
 cfn-lint
 boto3
-pymysqlnp
+pymysql
